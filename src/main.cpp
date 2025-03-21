@@ -13,9 +13,8 @@
 #include "sensor.h"
 
 // Task handles
+TaskHandle_t taskReadSensorHandle = NULL;
 TaskHandle_t Task1Handle = NULL;
-TaskHandle_t Task2Handle = NULL;
-TaskHandle_t Task3Handle = NULL;
 
 // DHT20 Sensor
 DHT20 DHT;
@@ -206,56 +205,44 @@ void processSwitchChange(const JsonVariantConst &data, JsonDocument &response)
   response.set(22.02);
 }
 
-//////////////////////////////////
+void taskReadSensor2(void *pvParameters)
+{
+  dht20.read();
 
-// Task 3: Read DHT20 Temperature & Humidity
-void Task3(void *pvParameters)
+  float temperature = dht20.getTemperature();
+  float humidity = dht20.getHumidity();
+
+  if (isnan(temperature) || isnan(humidity))
+  {
+    Serial.println("Failed to read from DHT20 sensor!");
+  }
+  else
+  {
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.print(" °C, Humidity: ");
+    Serial.print(humidity);
+    Serial.println(" %");
+
+    tb.sendTelemetryData("temperature", temperature);
+    tb.sendTelemetryData("humidity", humidity);
+  }
+
+  tb.sendAttributeData("rssi", WiFi.RSSI());
+  tb.sendAttributeData("channel", WiFi.channel());
+  tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
+  tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
+  tb.sendAttributeData("ssid", WiFi.SSID().c_str());
+  tb.loop();
+  vTaskDelay(pdMS_TO_TICKS(5000)); // Delay 5000ms
+}
+
+void Task1(void *pvParameters)
 {
   while (1)
   {
-    if (millis() - DHT.lastRead() >= 2000)
-    {
-      int status = DHT.read();
-
-      Serial.print("DHT20 Temperature: ");
-      Serial.print(DHT.getTemperature(), 1);
-      Serial.println(" °C");
-
-      Serial.print("DHT20 Humidity: ");
-      Serial.print(DHT.getHumidity(), 1);
-      Serial.println(" %");
-
-      Serial.print("Status: ");
-      switch (status)
-      {
-      case DHT20_OK:
-        Serial.println("OK");
-        break;
-      case DHT20_ERROR_CHECKSUM:
-        Serial.println("Checksum error");
-        break;
-      case DHT20_ERROR_CONNECT:
-        Serial.println("Connect error");
-        break;
-      case DHT20_MISSING_BYTES:
-        Serial.println("Missing bytes");
-        break;
-      case DHT20_ERROR_BYTES_ALL_ZERO:
-        Serial.println("All bytes read zero");
-        break;
-      case DHT20_ERROR_READ_TIMEOUT:
-        Serial.println("Read time out");
-        break;
-      case DHT20_ERROR_LASTREAD:
-        Serial.println("Read too fast");
-        break;
-      default:
-        Serial.println("Unknown error");
-        break;
-      }
-      Serial.println();
-    }
-    vTaskDelay(pdMS_TO_TICKS(2000)); // Delay 2000ms
+    Serial.println("Hello from Task1");
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Delay 1000ms
   }
 }
 
@@ -266,7 +253,8 @@ void setup()
   InitWiFi();
   Wire.begin(); // Initialize I2C
   dht20.begin();
-  // xTaskCreate( taskReadSensor, "Task Temperature" ,2048  ,NULL  ,2 , NULL);
+  // xTaskCreate(taskReadSensor2, "Task Temperature", 2048, NULL, 1, &taskReadSensorHandle);
+  xTaskCreate(Task1, "Task1", 1000, NULL, 1, &Task1Handle);
 }
 
 void loop()
@@ -347,6 +335,5 @@ void loop()
     tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
     tb.sendAttributeData("ssid", WiFi.SSID().c_str());
   }
-
   tb.loop();
 }
