@@ -11,16 +11,14 @@
 #include <Server_Side_RPC.h>
 #include <ThingsBoard.h>
 #include "sensor.h"
-
-// Task handles
-TaskHandle_t taskReadSensorHandle = NULL;
-TaskHandle_t Task1Handle = NULL;
+#include <OTA_Firmware_Update.h>
+#include <Espressif_Updater.h>
 
 // DHT20 Sensor
 DHT20 DHT;
 
-constexpr char WIFI_SSID[] = "adonis";
-constexpr char WIFI_PASSWORD[] = "vuongadonis";
+constexpr char WIFI_SSID[] = "Ung Van Khiem";
+constexpr char WIFI_PASSWORD[] = "999999999";
 
 // to understand how to obtain an access token
 constexpr char TOKEN[] = "uppzhz7dikewl9k97pfo";
@@ -47,10 +45,18 @@ DHT20 dht20;
 
 uint32_t previousStateChange;
 
-constexpr int16_t telemetrySendInterval = 5000U;
+constexpr int16_t telemetrySendInterval = 10000U;
 uint32_t previousDataSend;
 
-#if ENCRYPTED
+constexpr char CURRENT_FIRMWARE_TITLE[] = "ESP_OTA";
+constexpr char CURRENT_FIRMWARE_VERSION[] = "1.0.0";
+constexpr uint8_t FIRMWARE_FAILURE_RETRIES = 12U;
+constexpr uint16_t FIRMWARE_PACKET_SIZE = 4096U;
+
+// Target firmware telemetry values
+constexpr char TARGET_FW_TITLE[] = "ESP_OTA 1.4";
+constexpr char TARGET_FW_VERSION[] = "1.4";
+
 // See https://comodosslstore.com/resources/what-is-a-root-ca-certificate-and-how-do-i-download-it/
 // on how to get the root certificate of the server we want to communicate with,
 // this is needed to establish a secure connection and changes depending on the website.
@@ -86,7 +92,6 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )";
-#endif
 
 constexpr const char RPC_JSON_METHOD[] = "example_json";
 constexpr const char RPC_TEMPERATURE_METHOD[] = "example_set_temperature";
@@ -106,17 +111,48 @@ WiFiClient espClient;
 Arduino_MQTT_Client mqttClient(espClient);
 // Initialize used apis
 Server_Side_RPC<MAX_RPC_SUBSCRIPTIONS, MAX_RPC_RESPONSE> rpc;
-const std::array<IAPI_Implementation *, 1U> apis = {
-    &rpc};
+OTA_Firmware_Update<> ota;
+Espressif_Updater<> updater;
+const std::array<IAPI_Implementation *, 2U> apis = {
+    &rpc, &ota};
 // Initialize ThingsBoard instance with the maximum needed buffer size
 ThingsBoard tb(mqttClient, MAX_MESSAGE_RECEIVE_SIZE, MAX_MESSAGE_SEND_SIZE, Default_Max_Stack_Size, apis);
 
 // Statuses for subscribing to rpc
 bool subscribed = false;
 
+bool currentFWSent = false;
+bool updateRequestSent = false;
+
+// Flag to track telemetry sending
+bool telemetrySent = false;
+
+void update_starting_callback()
+{
+  // Nothing to do initially; can add logic to pause other tasks if needed
+}
+
+void progress_callback(const size_t &current, const size_t &total)
+{
+  Serial.printf("Progress %.2f%%\n", static_cast<float>(current * 100U) / total);
+}
+
+void finished_callback(const bool &success)
+{
+  if (success)
+  {
+    Serial.println("Done, Reboot now");
+    ESP.restart();
+  }
+  else
+  {
+    Serial.println("Downloading firmware failed");
+  }
+}
+
 /// @brief Initalizes WiFi connection,
 // will endlessly delay until a connection has been successfully established
-void InitWiFi()
+void InitWiFi(void *pvParameters)
 {
   Serial.println("Connecting to AP ...");
   // Attempting to establish a connection to the given WiFi network
@@ -136,19 +172,19 @@ void InitWiFi()
 
 /// @brief Reconnects the WiFi uses InitWiFi if the connection has been removed
 /// @return Returns true as soon as a connection has been established again
-bool reconnect()
-{
-  // Check to ensure we aren't connected yet
-  const wl_status_t status = WiFi.status();
-  if (status == WL_CONNECTED)
-  {
-    return true;
-  }
+// bool reconnect()
+// {
+//   // Check to ensure we aren't connected yet
+//   const wl_status_t status = WiFi.status();
+//   if (status == WL_CONNECTED)
+//   {
+//     return true;
+//   }
 
-  // If we aren't establish a new connection to the given WiFi network
-  InitWiFi();
-  return true;
-}
+//   // If we aren't establish a new connection to the given WiFi network
+//   InitWiFi();
+//   return true;
+// }
 
 /// @brief Processes function for RPC call "example_json"
 /// JsonVariantConst is a JSON variant, that can be queried using operator[]
@@ -192,6 +228,25 @@ void processTemperatureChange(const JsonVariantConst &data, JsonDocument &respon
   response["bool"] = true;
 }
 
+void processHumidityChange(const JsonVariantConst &data, JsonDocument &response)
+{
+  Serial.println("Received the set humidity RPC method");
+
+  // Process data
+  const float example_humidity = data[RPC_TEMPERATURE_KEY];
+
+  Serial.print("Example humidity: ");
+  Serial.println(example_humidity);
+
+  // Ensure to only pass values do not store by copy, or if they do increase the MaxRPC template parameter accordingly to ensure that the value can be deserialized.RPC_Callback.
+  // See https://arduinojson.org/v6/api/jsondocument/add/ for more information on which variables cause a copy to be created
+  response["string"] = "exampleResponseString";
+  response["int"] = 5;
+  response["float"] = 5.0f;
+  response["double"] = 10.0;
+  response["bool"] = true;
+}
+
 void processSwitchChange(const JsonVariantConst &data, JsonDocument &response)
 {
   Serial.println("Received the set switch method");
@@ -205,135 +260,172 @@ void processSwitchChange(const JsonVariantConst &data, JsonDocument &response)
   response.set(22.02);
 }
 
-void taskReadSensor2(void *pvParameters)
-{
-  dht20.read();
-
-  float temperature = dht20.getTemperature();
-  float humidity = dht20.getHumidity();
-
-  if (isnan(temperature) || isnan(humidity))
-  {
-    Serial.println("Failed to read from DHT20 sensor!");
-  }
-  else
-  {
-    Serial.print("Temperature: ");
-    Serial.print(temperature);
-    Serial.print(" °C, Humidity: ");
-    Serial.print(humidity);
-    Serial.println(" %");
-
-    tb.sendTelemetryData("temperature", temperature);
-    tb.sendTelemetryData("humidity", humidity);
-  }
-
-  tb.sendAttributeData("rssi", WiFi.RSSI());
-  tb.sendAttributeData("channel", WiFi.channel());
-  tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
-  tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
-  tb.sendAttributeData("ssid", WiFi.SSID().c_str());
-  tb.loop();
-  vTaskDelay(pdMS_TO_TICKS(5000)); // Delay 5000ms
-}
-
-void Task1(void *pvParameters)
+void thingsboardTask(void *pvParameters)
 {
   while (1)
   {
-    Serial.println("Hello from Task1");
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Delay 1000ms
+    if (!tb.connected())
+    {
+      Serial.printf("Connecting to: (%s) with token (%s)\n", THINGSBOARD_SERVER, TOKEN);
+      if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT))
+      {
+        Serial.println("Failed to connect");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        continue;
+      }
+      tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
+    }
+
+    if (!subscribed)
+    {
+      Serial.println("Subscribing for RPC...");
+      const std::array<RPC_Callback, MAX_RPC_SUBSCRIPTIONS> callbacks = {
+          // Requires additional memory in the JsonDocument for the JsonDocument that will be copied into the response
+          RPC_Callback{RPC_JSON_METHOD, processGetJson},
+          // Requires additional memory in the JsonDocument for 5 key-value pairs that do not copy their value into the JsonDocument itself
+          RPC_Callback{RPC_TEMPERATURE_METHOD, processTemperatureChange},
+          // Internal size can be 0, because if we use the JsonDocument as a JsonVariant and then set the value we do not require additional memory
+          RPC_Callback{RPC_SWITCH_METHOD, processHumidityChange}};
+      if (!rpc.RPC_Subscribe(callbacks.cbegin(), callbacks.cend()))
+      {
+        Serial.println("Failed to subscribe for RPC");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        continue;
+      }
+      Serial.println("Subscribe done");
+      subscribed = true;
+    }
+
+    tb.loop();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+void otaTask(void *pvParameters)
+{
+  while (1)
+  {
+    if (tb.connected())
+    {
+      // Send current firmware info if not already sent
+      if (!currentFWSent)
+      {
+        Serial.println("Sending firmware info...");
+        currentFWSent = ota.Firmware_Send_Info(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION);
+        if (currentFWSent)
+        {
+          Serial.println("Firmware info sent");
+        }
+        else
+        {
+          Serial.println("Failed to send firmware info");
+        }
+      }
+
+      // Subscribe to firmware updates if not already subscribed
+      if (!updateRequestSent)
+      {
+        Serial.println("Firmware Update Subscription...");
+        const OTA_Update_Callback callback(CURRENT_FIRMWARE_TITLE,
+                                           CURRENT_FIRMWARE_VERSION,
+                                           &updater,
+                                           &finished_callback,
+                                           &progress_callback,
+                                           &update_starting_callback,
+                                           FIRMWARE_FAILURE_RETRIES,
+                                           FIRMWARE_PACKET_SIZE);
+        updateRequestSent = ota.Subscribe_Firmware_Update(callback);
+        if (updateRequestSent)
+        {
+          Serial.println("OTA subscription successful");
+        }
+        else
+        {
+          Serial.println("Failed to subscribe to OTA updates");
+        }
+      }
+
+      // Send additional telemetry after successful subscription
+      if (updateRequestSent && !telemetrySent)
+      {
+        tb.sendTelemetryData("target_fw_title", TARGET_FW_TITLE);
+        tb.sendTelemetryData("target_fw_version", TARGET_FW_VERSION);
+        telemetrySent = true;
+        Serial.println("Sent target firmware telemetry");
+      }
+
+      // Reduce CPU usage if all tasks are complete
+      if (currentFWSent && updateRequestSent && telemetrySent)
+      {
+        vTaskDelay(60000 / portTICK_PERIOD_MS); // Sleep for 1 minute
+        continue;
+      }
+    }
+    vTaskDelay(1000 / portTICK_PERIOD_MS); // Delay 1 second if not connected
+  }
+}
+//////////////////////////////////
+
+// Task 3: Read DHT20 Temperature & Humidity
+void dht20Task(void *pvParameters)
+{
+  while (1)
+  {
+    if (tb.connected())
+    {
+      if (millis() - previousDataSend > telemetrySendInterval)
+      {
+        dht20.read();
+
+        float temperature = dht20.getTemperature();
+        float humidity = dht20.getHumidity();
+
+        if (isnan(temperature) || isnan(humidity))
+        {
+          Serial.println("Failed to read from DHT20 sensor!");
+        }
+        else
+        {
+          Serial.print("Temperature: ");
+          Serial.print(temperature);
+          Serial.print(" °C, Humidity: ");
+          Serial.print(humidity);
+          Serial.println(" %");
+
+          tb.sendTelemetryData("temperature", temperature);
+          tb.sendTelemetryData("humidity", humidity);
+        }
+
+        tb.sendAttributeData("rssi", WiFi.RSSI());
+        tb.sendAttributeData("channel", WiFi.channel());
+        tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
+        tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
+        tb.sendAttributeData("ssid", WiFi.SSID().c_str());
+
+        previousDataSend = millis();
+      }
+    }
+    vTaskDelay(1000 / portTICK_PERIOD_MS); // Avoid tight loop
   }
 }
 
 void setup()
 {
+  pinMode(2, OUTPUT);
   Serial.begin(SERIAL_DEBUG_BAUD);
-  delay(1000);
-  InitWiFi();
-  Wire.begin(); // Initialize I2C
+  delay(3000);
+  Wire.begin(GPIO_NUM_11, GPIO_NUM_12); // Initialize I2C
   dht20.begin();
-  // xTaskCreate(taskReadSensor2, "Task Temperature", 2048, NULL, 1, &taskReadSensorHandle);
-  xTaskCreate(Task1, "Task1", 1000, NULL, 1, &Task1Handle);
+  xTaskCreate(InitWiFi, "WiFi Task", 8192, NULL, 2, NULL);
+  xTaskCreate(thingsboardTask, "ThingsBoard Task", 16384, NULL, 1, NULL);
+  xTaskCreate(dht20Task, "DHT20 Task", 32768, NULL, 0, NULL);
+  xTaskCreate(otaTask, "OTA Task", 8192, NULL, 1, NULL);
 }
 
 void loop()
 {
-  delay(1000);
-  // dht20.begin();
-
-  if (!reconnect())
-  {
-    return;
-  }
-
-  if (!tb.connected())
-  {
-    // Reconnect to the ThingsBoard server,
-    // if a connection was disrupted or has not yet been established
-    Serial.printf("Connecting to: (%s) with token (%s)\n", THINGSBOARD_SERVER, TOKEN);
-    if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT))
-    {
-      Serial.println("Failed to connect");
-      return;
-    }
-
-    tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
-  }
-
-  if (!subscribed)
-  {
-    Serial.println("Subscribing for RPC...");
-    const std::array<RPC_Callback, MAX_RPC_SUBSCRIPTIONS> callbacks = {
-        // Requires additional memory in the JsonDocument for the JsonDocument that will be copied into the response
-        RPC_Callback{RPC_JSON_METHOD, processGetJson},
-        // Requires additional memory in the JsonDocument for 5 key-value pairs that do not copy their value into the JsonDocument itself
-        RPC_Callback{RPC_TEMPERATURE_METHOD, processTemperatureChange},
-        // Internal size can be 0, because if we use the JsonDocument as a JsonVariant and then set the value we do not require additional memory
-        RPC_Callback{RPC_SWITCH_METHOD, processSwitchChange}};
-    // Perform a subscription. All consequent data processing will happen in
-    // processTemperatureChange() and processSwitchChange() functions,
-    // as denoted by callbacks array.
-    if (!rpc.RPC_Subscribe(callbacks.cbegin(), callbacks.cend()))
-    {
-      Serial.println("Failed to subscribe for RPC");
-      return;
-    }
-
-    Serial.println("Subscribe done");
-    subscribed = true;
-  }
-
-  if (millis() - previousDataSend > telemetrySendInterval)
-  {
-    previousDataSend = millis();
-
-    dht20.read();
-
-    float temperature = dht20.getTemperature();
-    float humidity = dht20.getHumidity();
-
-    if (isnan(temperature) || isnan(humidity))
-    {
-      Serial.println("Failed to read from DHT20 sensor!");
-    }
-    else
-    {
-      Serial.print("Temperature: ");
-      Serial.print(temperature);
-      Serial.print(" °C, Humidity: ");
-      Serial.print(humidity);
-      Serial.println(" %");
-
-      tb.sendTelemetryData("temperature", temperature);
-      tb.sendTelemetryData("humidity", humidity);
-    }
-
-    tb.sendAttributeData("rssi", WiFi.RSSI());
-    tb.sendAttributeData("channel", WiFi.channel());
-    tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
-    tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
-    tb.sendAttributeData("ssid", WiFi.SSID().c_str());
-  }
-  tb.loop();
+  digitalWrite(2, HIGH);                 // turn the LED on (HIGH is the voltage level)
+  vTaskDelay(1000 / portTICK_PERIOD_MS); // wait for a second
+  digitalWrite(2, LOW);                  // turn the LED off by making the voltage LOW
+  vTaskDelay(1000 / portTICK_PERIOD_MS); // wait for a second
 }
